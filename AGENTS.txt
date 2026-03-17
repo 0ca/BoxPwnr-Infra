@@ -1,0 +1,120 @@
+# BoxPwnr-Infra
+
+Infrastructure, benchmarking, and dashboard for [BoxPwnr](https://github.com/0ca/BoxPwnr).
+
+## Repository Layout
+
+```
+.
+├── launch_benchmark.py      # Main orchestration script
+├── build_push_docker.sh     # Docker image build & ECR push
+├── build_ami.sh             # Golden AMI builder (pre-loads Docker image)
+├── push_claude_usage.sh     # Cron: pushes Claude/Codex usage to S3 (macOS)
+├── dashboard/
+│   ├── index.html           # Static S3-hosted dashboard
+│   └── push_runner_stats.py # Cron: collects stats on runner, uploads to S3
+├── infra/
+│   ├── main.tf              # Shared resources (ECR, IAM, Security Groups)
+│   ├── variables.tf
+│   ├── terraform.tfvars
+│   ├── templates/           # Per-runner EC2 Terraform templates
+│   └── runner-N/            # Per-runner Terraform state (gitignored)
+└── .env                     # DASHBOARD_BUCKET (gitignored)
+```
+
+## Setup
+
+Requires: AWS CLI configured, Terraform, Docker, a sibling `BoxPwnr/` checkout (or set `BOXPWNR_ROOT`).
+
+```bash
+# .env must have:
+DASHBOARD_BUCKET='boxpwnr-runners-dashboard'
+```
+
+BoxPwnr's `.env` (API keys, secrets) is loaded as a fallback.
+
+## CLI Reference
+
+### Launching a benchmark
+
+```bash
+python launch_benchmark.py \
+  --runner 1 \
+  --key-path "~/.ssh/key.pem" \
+  --model claude-sonnet-4-20250514 \
+  --solver chat_tools \
+  --platform htb \
+  --targets "Lame,Jerry,Shocker" \
+  --max-turns 80 --max-cost 2.0 --max-time 60 --attempts 1
+```
+
+Key benchmark args:
+- `--runner N` — runner ID (creates EC2 if needed)
+- `--key-path` — SSH key (required for benchmark, optional for management)
+- `--model` / `--solver` / `--platform` / `--executor`
+- `--target` / `--targets` (comma-sep) / `--targets-file` (one per line)
+- `--max-turns` / `--max-cost` / `--max-time` / `--attempts`
+- `--reasoning-effort` (minimal/low/medium/high) for reasoning models
+- `--env-file` — custom .env to upload to runner
+- `--dashboard-bucket` — S3 bucket for dashboard (defaults to `DASHBOARD_BUCKET`)
+- `--skip-build` — skip Docker build, use existing ECR image
+- `--no-auto-stop` — don't stop instance after benchmarks finish
+- `--resume-from` — path to progress.md from a previous attempt
+
+### Management commands
+
+All require `--runner N`. Multiple actions can be combined and execute in order.
+
+```bash
+# Single actions
+python launch_benchmark.py --list                        # List all runners
+python launch_benchmark.py --ssh --runner 1              # SSH to runner
+python launch_benchmark.py --tmux --runner 1             # Attach to tmux session
+python launch_benchmark.py --stats --runner 1            # Show benchmark stats
+python launch_benchmark.py --rsync --runner 1            # Download results
+python launch_benchmark.py --exec 'ls -la' --runner 1    # Run arbitrary command
+python launch_benchmark.py --start --runner 1            # Start stopped instance
+python launch_benchmark.py --stop --runner 1             # Stop instance (restartable)
+python launch_benchmark.py --clear --runner 1            # Delete traces on runner
+python launch_benchmark.py --destroy --runner 1          # Destroy infrastructure
+
+# Combined actions (execute left to right)
+python launch_benchmark.py --rsync --stop --runner 1     # Download then stop
+python launch_benchmark.py --rsync --clear --runner 1    # Download then clear traces
+python launch_benchmark.py --start --rsync --stop --runner 1  # Start, download, stop
+
+# Dashboard
+python launch_benchmark.py --push-dashboard              # Collect & push stats from all runners
+```
+
+Notes:
+- `--ssh` and `--tmux` are interactive (replace process), cannot combine with other actions
+- `--destroy` always runs last regardless of flag order
+- `--key-path` is optional for management (uses ssh-agent)
+
+## Architecture
+
+### Multi-Runner System
+- **Shared infrastructure**: ECR repo, IAM roles, security groups (one Terraform state)
+- **Per-runner infrastructure**: EC2 instance with separate Terraform state in `infra/runner-N/`
+- Runners are independent — create/stop/destroy individually
+
+### Dashboard
+- Static HTML hosted on S3 (`index.html`)
+- Each runner pushes `data/runner-N.json` to S3 every minute via cron
+- Runner 1 also pushes `data/claude-usage.json`
+- Dashboard auto-refreshes every 60s
+- Supports multiple concurrent "running" targets per runner (stalled + active)
+
+### BoxPwnr Dependency
+Scripts find BoxPwnr via `BOXPWNR_ROOT` env var or as a sibling directory (`../BoxPwnr`).
+Used for: Dockerfile path, rsync project files to runner, .env fallback (API keys).
+
+### Docker
+- Shared ECR repository, image tagged by Dockerfile content hash
+- S3 cache for fast loading on new instances (ECR pull ~30min vs S3 ~1min)
+- Cross-platform builds handled (ARM Mac -> x86_64 EC2)
+
+### Golden AMI
+`build_ami.sh` creates a pre-baked AMI with Docker, uv, and the Docker image loaded.
+Eliminates ~5min setup per new runner. AMI ID written to `infra/.golden_ami_id`.
