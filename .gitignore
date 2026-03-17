@@ -1,0 +1,8 @@
+.env
+.last_docker_hash
+__pycache__/
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+infra/.golden_ami_id
