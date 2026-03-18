@@ -542,7 +542,7 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None):
             "xbow":      (80, 50),
             "hackbench": (80, 50),
         }
-        default_sizes = (40, 30)
+        default_sizes = (45, 35)
         non_golden_size, golden_size = PLATFORM_DISK_SIZES.get(platform, default_sizes)
         volume_size = golden_size if use_golden_ami else non_golden_size
         print(f"Using {volume_size}GB disk (platform: {platform}, golden_ami: {use_golden_ami})")
