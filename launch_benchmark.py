@@ -25,7 +25,7 @@ from pathlib import Path
 DEFAULT_MODEL = "openrouter/openrouter/free"
 DEFAULT_TARGET = "meow"
 DEFAULT_PLATFORM = "htb"
-DEFAULT_SOLVER = "chat"  # Default solver to match main CLI
+DEFAULT_SOLVER = "single_loop"  # Default solver to match main CLI
 DEFAULT_MAX_TURNS = 80
 DEFAULT_MAX_COST = 2.0  # Default max cost per attempt in USD
 DEFAULT_ATTEMPTS = 1
@@ -436,7 +436,7 @@ def ensure_shared_infrastructure():
         print(f"Failed to create shared infrastructure: {e}")
         sys.exit(1)
 
-def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None):
+def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=True):
     """Deploy infrastructure for a specific runner using separate Terraform state.
 
     Args:
@@ -551,6 +551,7 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None):
             f"-var=runner_id={runner_id}",
             f"-var=root_volume_size={volume_size}",
             f"-var=use_golden_ami={str(use_golden_ami).lower()}",
+            f"-var=use_spot={str(use_spot).lower()}",
         ]
         run_command(tf_apply_cmd, cwd=runner_infra_dir)
         
@@ -596,6 +597,7 @@ def transfer_files(instance_ip, key_path):
         "--exclude", "validation-benchmarks",
         "--exclude", "HackBench",
         "--exclude", "replayer/tests",
+        "--exclude", "BoxPwnr-Traces",
         "-e", f"ssh -i \"{key_path}\" -o StrictHostKeyChecking=no",  # Double quote the key path
         f"{str(PROJECT_ROOT)}/",  # Add trailing slash to copy contents, not the directory itself
         f"ubuntu@{instance_ip}:BoxPwnr"  # Copy directly to ~/BoxPwnr instead of ~/boxpwnr
@@ -668,6 +670,9 @@ ls -la
 echo "=== Installing uv and creating environment ==="
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+# Remove stale .venv from golden AMI so uv rebuilds from rsync'd source
+rm -rf .venv
 
 # Create virtual environment and install dependencies
 echo "=== Installing Python dependencies with uv ==="
@@ -794,7 +799,7 @@ echo "=== Environment setup complete ==="
         print(f"Failed during environment setup: {e}")
         sys.exit(1)
 
-def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True):
+def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True):
     """Start the BoxPwnr benchmark in a tmux session using a single determined directory path.
 
     Args:
@@ -805,7 +810,7 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         model: LLM model to use
         targets: List of target machine names to benchmark
         platform: Platform (htb, etc.)
-        solver: LLM solver to use (chat, chat_tools, chat_tools_compactation, claude_code, agent_tools)
+        solver: LLM solver to use (single_loop_xmltag, single_loop, single_loop_compactation, claude_code, codex)
         max_turns: Maximum number of conversation turns
         max_cost: Maximum cost per attempt in USD
         max_time: Maximum time in minutes per attempt (None for no limit)
@@ -853,6 +858,10 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         # Add CTF ID if specified
         if ctf_id:
             cmd_parts.insert(-1, f"--ctf-id {ctf_id}")
+
+        # Add CTFd URL if specified
+        if ctfd_url:
+            cmd_parts.insert(-1, f"--ctfd-url {ctfd_url}")
 
         # Add resume-from if specified (file already SCP'd to runner)
         if resume_from:
@@ -933,10 +942,17 @@ fi
     # Finish the script
     auto_stop_block = ""
     if auto_stop:
-        auto_stop_block = """
+        # Push final dashboard stats before shutdown so the dashboard doesn't show stale "running" status
+        final_push = ""
+        if dashboard_bucket:
+            final_push = f"""
+echo "Pushing final dashboard stats before shutdown..."
+cd ~/BoxPwnr && python3 push_runner_stats.py {runner_id} {dashboard_bucket} 2>/dev/null || true
+"""
+        auto_stop_block = f"""
 echo ""
 echo "===== Auto-stopping EC2 instance ====="
-# Remove @reboot cron so the instance stays up on next manual start (e.g. for rsync)
+{final_push}# Remove @reboot cron so the instance stays up on next manual start (e.g. for rsync)
 (crontab -l 2>/dev/null | grep -v '@reboot.*run_benchmarks' | crontab - 2>/dev/null) || true
 sudo shutdown -h now
 """
@@ -1929,7 +1945,7 @@ def main():
     parser.add_argument("--platform", default=DEFAULT_PLATFORM, help=f"Platform (default: {DEFAULT_PLATFORM})")
     parser.add_argument("--executor", default="docker", choices=['docker', 'ssh', 'platform'],
                         help="Executor type (default: docker)")
-    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['chat', 'chat_tools', 'chat_tools_compactation', 'claude_code', 'codex', 'agent_tools'],
+    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth'],
                        help=f"LLM solver to use (default: {DEFAULT_SOLVER})")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help=f"Maximum conversation turns (default: {DEFAULT_MAX_TURNS})")
     parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST, help=f"Maximum cost per attempt in USD (default: {DEFAULT_MAX_COST})")
@@ -1938,6 +1954,7 @@ def main():
                        help=f"Maximum time in minutes per attempt (default: {DEFAULT_MAX_TIME})")
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS, help=f"Number of attempts (default: {DEFAULT_ATTEMPTS})")
     parser.add_argument("--ctf-id", type=int, help="CTF ID (required for htb_ctf platform)")
+    parser.add_argument("--ctfd-url", type=str, help="CTFd instance URL (required for ctfd platform)")
     
     # Infrastructure arguments
     parser.add_argument("--key-path", help="Path to AWS EC2 SSH key file")
@@ -1957,6 +1974,9 @@ def main():
     parser.add_argument("--no-auto-stop", action="store_true",
                        help="Don't automatically stop the EC2 instance after all benchmarks finish. "
                             "By default, the instance is stopped (not terminated) when benchmarks complete.")
+    parser.add_argument("--no-spot", action="store_true",
+                       help="Use on-demand instances instead of spot instances. "
+                            "More expensive but won't be interrupted mid-challenge.")
     
     args = parser.parse_args()
     
@@ -2025,8 +2045,11 @@ def main():
         return
     
     # For benchmark operations, key-path is required (needed for EC2 creation)
+    # Fall back to SSH_KEY_PATH from .env if --key-path not provided
     if not args.key_path:
-        print("Error: --key-path is required for benchmark operations")
+        args.key_path = os.environ.get("SSH_KEY_PATH", "").strip().strip("'\"")
+    if not args.key_path:
+        print("Error: --key-path is required for benchmark operations (or set SSH_KEY_PATH in .env)")
         sys.exit(1)
     
     # Process targets parameter
@@ -2102,7 +2125,7 @@ def main():
     # STEP 1: Deploy infrastructure for the specific runner
     
     print(f"\n=== Step 1: Setting up AWS infrastructure for runner {target_runner_id} ===")
-    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform)
+    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=not getattr(args, 'no_spot', False))
     
     # Create runner manager and add this runner
     runner_manager = RunnerManager()
@@ -2239,6 +2262,7 @@ def main():
         target_runner_id,
         args.reasoning_effort,
         args.ctf_id,
+        getattr(args, 'ctfd_url', None),
         args.dashboard_bucket,
         getattr(args, 'executor', 'docker'),
         remote_resume_path,

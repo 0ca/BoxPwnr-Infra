@@ -42,7 +42,7 @@ python launch_benchmark.py \
   --runner 1 \
   --key-path "~/.ssh/key.pem" \
   --model claude-sonnet-4-20250514 \
-  --solver chat_tools \
+  --solver single_loop \
   --platform htb \
   --targets "Lame,Jerry,Shocker" \
   --max-turns 80 --max-cost 2.0 --max-time 60 --attempts 1
