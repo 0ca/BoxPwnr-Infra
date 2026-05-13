@@ -539,8 +539,10 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, u
         # Per-platform disk sizes (GB): non-golden-AMI / golden-AMI
         PLATFORM_DISK_SIZES = {
             "cybench":   (90, 60),
+            "cybergym":  (120, 90),  # vulnerable Docker images run 0.5–3 GB each, lazy-pulled
             "xbow":      (80, 50),
             "hackbench": (80, 50),
+            "argus":     (120, 90),  # docker images per challenge — 50 GB ran out at ~30 challenges
         }
         default_sizes = (45, 35)
         non_golden_size, golden_size = PLATFORM_DISK_SIZES.get(platform, default_sizes)
@@ -594,6 +596,7 @@ def transfer_files(instance_ip, key_path):
         "--exclude", "infra",
         "--exclude", "__pycache__",
         "--exclude", "cybench-repo",
+        "--exclude", "cybergym-repo",
         "--exclude", "validation-benchmarks",
         "--exclude", "HackBench",
         "--exclude", "replayer/tests",
@@ -904,6 +907,17 @@ cat > run_benchmarks.sh << 'EOL'
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 cd ~/BoxPwnr
 
+# CyberGym requires a local evaluation server (FastAPI) running on the runner.
+# The setup script is idempotent so we run it on every benchmark startup
+# (also covers the @reboot resume path).
+if [ "{platform}" = "cybergym" ]; then
+    echo "===== Cybergym setup ====="
+    bash ~/BoxPwnr-Infra/setup_cybergym_runner.sh || {{
+        echo "Cybergym setup failed; aborting benchmark sequence."
+        exit 1
+    }}
+fi
+
 echo "===== Starting benchmark sequence at $(date) ====="
 
 """
@@ -980,7 +994,7 @@ chmod +x run_benchmarks.sh
 # Copy backfill script and install cron for continuous dashboard updates
 cp {backfill_src} {backfill_dst}
 # Use || true so empty crontab (crontab -l exits 1) doesn't abort under set -e; then echo always runs
-reboot_entry="@reboot cd ~/BoxPwnr && tmux new-session -d -s benchmark-runner-{runner_id} './run_benchmarks.sh' >> /tmp/reboot_resume.log 2>&1"
+reboot_entry="@reboot cd ~/BoxPwnr && tmux new-session -d -s benchmark-runner-{runner_id} './run_benchmarks.sh 2>&1 | tee /tmp/run_benchmarks.log' >> /tmp/reboot_resume.log 2>&1"
 (crontab -l 2>/dev/null | grep -v 'push_runner_stats.py' | grep -v '@reboot.*run_benchmarks' || true; echo '{cron_entry}'; echo "$reboot_entry") | crontab -
 echo "Cron installed: dashboard stats push every minute + benchmark resume on reboot"
 
@@ -1009,9 +1023,9 @@ echo "Systemd eviction hook installed"
 """
 
     benchmark_script += f"""
-# Start benchmark in a tmux session
+# Start benchmark in a tmux session (tee to /tmp/run_benchmarks.log for visibility)
 echo "Starting benchmark in tmux session 'benchmark-runner-{runner_id}'..."
-tmux new-session -d -s benchmark-runner-{runner_id} './run_benchmarks.sh'
+tmux new-session -d -s benchmark-runner-{runner_id} './run_benchmarks.sh 2>&1 | tee /tmp/run_benchmarks.log'
 
 # Verify the session was created
 tmux list-sessions
