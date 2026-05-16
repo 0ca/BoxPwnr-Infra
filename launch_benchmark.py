@@ -690,6 +690,14 @@ which python
 python --version
 echo "VIRTUAL_ENV=$VIRTUAL_ENV"
 
+# Install the Chromium browser for Playwright. Required by the nvidia-web
+# LLM provider, which drives build.nvidia.com in a headless browser.
+# `playwright` (the Python package) is installed by `uv sync`, but the browser
+# binary + its OS libs are not — this fetches both. Idempotent: re-running is
+# a no-op once the browser is cached under ~/.cache/ms-playwright.
+echo "=== Installing Playwright Chromium browser ==="
+python -m playwright install --with-deps chromium
+
 
 # Install Node.js and mermaid-cli (mmdc) for diagram generation
 # Skipped: Validation removed, LLM output trusted directly
