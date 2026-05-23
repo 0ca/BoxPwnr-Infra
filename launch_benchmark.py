@@ -810,7 +810,7 @@ echo "=== Environment setup complete ==="
         print(f"Failed during environment setup: {e}")
         sys.exit(1)
 
-def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True):
+def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True, use_spot=True):
     """Start the BoxPwnr benchmark in a tmux session using a single determined directory path.
 
     Args:
@@ -832,6 +832,11 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         dashboard_bucket: Optional S3 bucket name for the monitoring dashboard.
             When set, the generated run_benchmarks.sh will push stats to S3
             after each target completes.
+        use_spot: When True (spot instances), the generated run_benchmarks.sh
+            skips targets that already have a completed trace so a
+            spot-eviction reboot resumes cleanly. When False (on-demand),
+            the skip block is omitted so reusing the runner to relaunch
+            attempts re-runs every target.
     """
     print(f"\n=== Starting benchmark on {instance_ip} ===")
     
@@ -937,10 +942,14 @@ echo "===== Starting benchmark sequence at $(date) ====="
         for ch in ['/', '\\', ':', '|', '*', '?', '<', '>', '"']:
             sanitized = sanitized.replace(ch, '-')
         traces_path = f"BoxPwnr-Traces/{platform}/{sanitized}/traces"
-        benchmark_script += f"""
-echo ""
-echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} ====="
 
+        # Skip-completed-trace guard is only useful for spot eviction recovery:
+        # after a reboot, @reboot cron re-runs run_benchmarks.sh and we don't
+        # want to redo targets that already finished. On on-demand runs the
+        # same logic backfires when the operator reuses the runner to launch
+        # more attempts against the same targets, so leave it out.
+        if use_spot:
+            skip_block = f"""
 # Skip if target already has a completed trace (not interrupted mid-run)
 SKIP_TARGET=false
 LATEST_STATS=$(ls -t "{traces_path}"/*/stats.json 2>/dev/null | head -1)
@@ -960,6 +969,17 @@ if [ "$SKIP_TARGET" = false ]; then
     echo "Completed at: $(date)"
 fi
 """
+        else:
+            skip_block = f"""
+echo "Starting at: $(date)"
+{benchmark_commands[i]}
+echo "Completed at: $(date)"
+"""
+
+        benchmark_script += f"""
+echo ""
+echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} ====="
+{skip_block}"""
     
     # Finish the script
     auto_stop_block = ""
@@ -2288,7 +2308,8 @@ def main():
         args.dashboard_bucket,
         getattr(args, 'executor', 'docker'),
         remote_resume_path,
-        auto_stop=not args.no_auto_stop
+        auto_stop=not args.no_auto_stop,
+        use_spot=not getattr(args, 'no_spot', False)
     )
     
     # Print dashboard URL at the very end for easy access
