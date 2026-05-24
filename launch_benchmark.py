@@ -27,7 +27,7 @@ DEFAULT_TARGET = "meow"
 DEFAULT_PLATFORM = "htb"
 DEFAULT_SOLVER = "single_loop"  # Default solver to match main CLI
 DEFAULT_MAX_TURNS = 80
-DEFAULT_MAX_COST = 2.0  # Default max cost per attempt in USD
+DEFAULT_MAX_COST = None  # Default: no max cost (useful for subscription-based solvers like grok / claude_code)
 DEFAULT_ATTEMPTS = 1
 DEFAULT_INSTANCE_COUNT = 1
 DEFAULT_MAX_TIME = 60  # Default max time per attempt in minutes
@@ -436,7 +436,7 @@ def ensure_shared_infrastructure():
         print(f"Failed to create shared infrastructure: {e}")
         sys.exit(1)
 
-def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=True):
+def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=False):
     """Deploy infrastructure for a specific runner using separate Terraform state.
 
     Args:
@@ -821,9 +821,9 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         model: LLM model to use
         targets: List of target machine names to benchmark
         platform: Platform (htb, etc.)
-        solver: LLM solver to use (single_loop_xmltag, single_loop, single_loop_compactation, claude_code, codex)
+        solver: LLM solver to use (single_loop_xmltag, single_loop, single_loop_compactation, claude_code, codex, grok)
         max_turns: Maximum number of conversation turns
-        max_cost: Maximum cost per attempt in USD
+        max_cost: Maximum cost per attempt in USD (None = no limit, good for subscriptions)
         max_time: Maximum time in minutes per attempt (None for no limit)
         attempts: Number of attempts per target
         runner_id: The runner ID
@@ -855,13 +855,16 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
             f"--platform {platform}",
             f"--target \"{target}\"",
             f"--max-turns {max_turns}",
-            f"--max-cost {max_cost}",
             f"--model \"{model}\"",
             f"--solver {solver}",
             "--traces-dir BoxPwnr-Traces/",
             f"--attempts {attempts}",
             "--analyze-attempt --generate-summary --generate-progress"
         ]
+
+        # Only set max-cost when explicitly provided (useful for subscription solvers like grok)
+        if max_cost is not None and max_cost > 0:
+            cmd_parts.insert(5, f"--max-cost {max_cost}")  # insert after --max-turns
 
         # Add max time if specified
         if max_time:
@@ -884,6 +887,15 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
             cmd_parts.insert(-1, f"--resume-from \"{resume_from}\"")
 
         cmd = " ".join(cmd_parts)
+        # Catch-all OS-level timeout against hangs. A wedged headless browser in
+        # the nvidia-web provider once froze runners for ~24h; --max-time only
+        # bounds the solve loop, not the post-solve analysis or a hung renderer.
+        # One boxpwnr invocation runs `attempts` attempts back-to-back, each with
+        # up to max_time minutes of solving plus analysis/setup overhead.
+        per_attempt_cap_min = (max_time or DEFAULT_MAX_TIME) + 25
+        hang_timeout_s = int(attempts * per_attempt_cap_min * 60)
+        # `timeout -k 60`: SIGTERM, then SIGKILL 60s later if still alive.
+        cmd = f"timeout -k 60 {hang_timeout_s} {cmd}"
         benchmark_commands.append(cmd)
     
     # For logging/debugging purposes
@@ -1987,10 +1999,12 @@ def main():
     parser.add_argument("--platform", default=DEFAULT_PLATFORM, help=f"Platform (default: {DEFAULT_PLATFORM})")
     parser.add_argument("--executor", default="docker", choices=['docker', 'ssh', 'platform'],
                         help="Executor type (default: docker)")
-    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth'],
+    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth', 'grok'],
                        help=f"LLM solver to use (default: {DEFAULT_SOLVER})")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help=f"Maximum conversation turns (default: {DEFAULT_MAX_TURNS})")
-    parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST, help=f"Maximum cost per attempt in USD (default: {DEFAULT_MAX_COST})")
+    parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST,
+                       help="Maximum cost per attempt in USD (default: no limit). "
+                            "Omit this for subscription-based solvers (grok, claude_code with OAuth, etc.)")
     # Default to 60 minutes when user doesn't specify max-time.
     parser.add_argument("--max-time", type=int, default=DEFAULT_MAX_TIME,
                        help=f"Maximum time in minutes per attempt (default: {DEFAULT_MAX_TIME})")
@@ -2016,9 +2030,9 @@ def main():
     parser.add_argument("--no-auto-stop", action="store_true",
                        help="Don't automatically stop the EC2 instance after all benchmarks finish. "
                             "By default, the instance is stopped (not terminated) when benchmarks complete.")
-    parser.add_argument("--no-spot", action="store_true",
-                       help="Use on-demand instances instead of spot instances. "
-                            "More expensive but won't be interrupted mid-challenge.")
+    parser.add_argument("--spot", action="store_true",
+                       help="Use Spot instances (cheaper, but can be interrupted or evicted). "
+                            "Default is on-demand for maximum reliability during long benchmarks.")
     
     args = parser.parse_args()
     
@@ -2120,6 +2134,13 @@ def main():
     else:
         print(f"No target specified, using default: {DEFAULT_TARGET}")
         target_list = [DEFAULT_TARGET]
+
+    # Smart default for Grok: if user didn't explicitly choose a model and we're using grok solver,
+    # use a descriptive name so the dashboard and traces show something meaningful instead of the
+    # generic "openrouter/openrouter/free" default.
+    if args.solver == "grok" and args.model == DEFAULT_MODEL:
+        args.model = "grok-build-0.1"
+        print("Note: Using --model grok-build-0.1 for Grok solver (for better logging/dashboard)")
         
     # Validate key path - expand user directory and resolve to full absolute path
     key_path = os.path.abspath(os.path.expanduser(args.key_path))
@@ -2154,7 +2175,7 @@ def main():
     print(f"Targets:         {', '.join(target_list)}")
     print(f"Platform:        {args.platform}")
     print(f"Max Turns:       {args.max_turns}")
-    print(f"Max Cost:        ${args.max_cost}")
+    print(f"Max Cost:        ${args.max_cost}" if args.max_cost else "Max Cost:        No limit (subscription)")
     print(f"Max Time:        {args.max_time} minutes" if args.max_time else "Max Time:        No limit")
     print(f"Attempts:        {args.attempts}")
     print(f"Runner:          {target_runner_id}")
@@ -2167,7 +2188,7 @@ def main():
     # STEP 1: Deploy infrastructure for the specific runner
     
     print(f"\n=== Step 1: Setting up AWS infrastructure for runner {target_runner_id} ===")
-    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=not getattr(args, 'no_spot', False))
+    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=getattr(args, 'spot', False))
     
     # Create runner manager and add this runner
     runner_manager = RunnerManager()
@@ -2265,6 +2286,39 @@ def main():
             f"ubuntu@{instance_ip}:BoxPwnr/.env"
         ]
         run_command(rsync_env_cmd)
+    
+    # Automatically transfer Grok auth when using --solver grok
+    # (so the remote runner can inject it into challenge containers)
+    if getattr(args, 'solver', None) == "grok":
+        grok_auth_local = os.path.expanduser("~/.grok/auth.json")
+        if os.path.exists(grok_auth_local):
+            print("Transferring ~/.grok/auth.json for Grok solver...")
+            # Ensure remote ~/.grok directory exists with correct permissions
+            mkdir_cmd = [
+                "ssh", "-i", key_path, "-o", "StrictHostKeyChecking=no",
+                f"ubuntu@{instance_ip}",
+                "mkdir -p ~/.grok && chmod 700 ~/.grok"
+            ]
+            run_command(mkdir_cmd, capture_output=True)
+            
+            rsync_grok_cmd = [
+                "rsync", "-avz",
+                "-e", f"ssh -i \"{key_path}\" -o StrictHostKeyChecking=no",
+                grok_auth_local,
+                f"ubuntu@{instance_ip}:~/.grok/auth.json"
+            ]
+            run_command(rsync_grok_cmd)
+            
+            chmod_cmd = [
+                "ssh", "-i", key_path, "-o", "StrictHostKeyChecking=no",
+                f"ubuntu@{instance_ip}",
+                "chmod 600 ~/.grok/auth.json"
+            ]
+            run_command(chmod_cmd, capture_output=True)
+            print("Grok auth.json transferred successfully to runner.")
+        else:
+            print("WARNING: --solver grok requested but ~/.grok/auth.json not found locally.")
+            print("         The Grok solver will fail to authenticate on the remote runner.")
     
     # Transfer resume-from progress file if specified
     remote_resume_path = None
