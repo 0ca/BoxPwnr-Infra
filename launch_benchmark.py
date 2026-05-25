@@ -892,7 +892,10 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         # bounds the solve loop, not the post-solve analysis or a hung renderer.
         # One boxpwnr invocation runs `attempts` attempts back-to-back, each with
         # up to max_time minutes of solving plus analysis/setup overhead.
-        per_attempt_cap_min = (max_time or DEFAULT_MAX_TIME) + 25
+        # Buffer above max_time must cover post-solve analysis AND the
+        # nvidia-web cold-start captcha retries (up to ~20 min of reloads on a
+        # bad start). +25 was too tight and killed legit long runs mid-flight.
+        per_attempt_cap_min = (max_time or DEFAULT_MAX_TIME) + 45
         hang_timeout_s = int(attempts * per_attempt_cap_min * 60)
         # `timeout -k 60`: SIGTERM, then SIGKILL 60s later if still alive.
         cmd = f"timeout -k 60 {hang_timeout_s} {cmd}"
@@ -991,6 +994,11 @@ echo "Completed at: $(date)"
         benchmark_script += f"""
 echo ""
 echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} ====="
+# Remove any leftover challenge container from a prior killed/crashed attempt.
+# Without this, a single timed-out/crashed run orphans the "challenge"
+# container and every subsequent target fails to start with a name conflict
+# ("The container name /challenge is already in use") -> cascade of init_errors.
+docker rm -f challenge >/dev/null 2>&1 || true
 {skip_block}"""
     
     # Finish the script
