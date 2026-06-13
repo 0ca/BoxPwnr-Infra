@@ -538,11 +538,12 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, u
         use_golden_ami = GOLDEN_AMI_FILE.exists()
         # Per-platform disk sizes (GB): non-golden-AMI / golden-AMI
         PLATFORM_DISK_SIZES = {
-            "cybench":   (90, 60),
-            "cybergym":  (120, 90),  # vulnerable Docker images run 0.5–3 GB each, lazy-pulled
-            "xbow":      (80, 50),
-            "hackbench": (80, 50),
-            "argus":     (120, 90),  # docker images per challenge — 50 GB ran out at ~30 challenges
+            "cybench":      (90, 60),
+            "cybergym":     (120, 90),  # vulnerable Docker images run 0.5–3 GB each, lazy-pulled
+            "exploitbench": (200, 150),  # CVE env images ~65GB each (amd64-only); lazy-pulled per target
+            "xbow":         (80, 50),
+            "hackbench":    (80, 50),
+            "argus":        (120, 90),  # docker images per challenge — 50 GB ran out at ~30 challenges
         }
         default_sizes = (45, 35)
         non_golden_size, golden_size = PLATFORM_DISK_SIZES.get(platform, default_sizes)
@@ -597,6 +598,7 @@ def transfer_files(instance_ip, key_path):
         "--exclude", "__pycache__",
         "--exclude", "cybench-repo",
         "--exclude", "cybergym-repo",
+        "--exclude", "exploitbench-repo",
         "--exclude", "validation-benchmarks",
         "--exclude", "HackBench",
         "--exclude", "replayer/tests",
@@ -810,7 +812,7 @@ echo "=== Environment setup complete ==="
         print(f"Failed during environment setup: {e}")
         sys.exit(1)
 
-def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True, use_spot=True):
+def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True, use_spot=True, exploitbench_config="v8", exploitbench_success_cap="diff", exploitbench_seed=1):
     """Start the BoxPwnr benchmark in a tmux session using a single determined directory path.
 
     Args:
@@ -859,8 +861,14 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
             f"--solver {solver}",
             "--traces-dir BoxPwnr-Traces/",
             f"--attempts {attempts}",
-            "--analyze-attempt --generate-summary --generate-progress"
         ]
+
+        # Post-processing (analyze/summary/progress) makes extra LLM calls AFTER the
+        # main loop. On cybergym (NVIDIA NIM) these can hang on API timeouts and the
+        # status never finalizes (stats.json stuck "running"), wedging the sequence.
+        # Skip them for cybergym; keep for everything else.
+        if platform != "cybergym":
+            cmd_parts.append("--analyze-attempt --generate-summary --generate-progress")
 
         # Only set max-cost when explicitly provided (useful for subscription solvers like grok)
         if max_cost is not None and max_cost > 0:
@@ -885,6 +893,11 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         # Add resume-from if specified (file already SCP'd to runner)
         if resume_from:
             cmd_parts.insert(-1, f"--resume-from \"{resume_from}\"")
+
+        if platform == "exploitbench":
+            cmd_parts.insert(-1, f"--exploitbench-config {exploitbench_config}")
+            cmd_parts.insert(-1, f"--exploitbench-success-cap {exploitbench_success_cap}")
+            cmd_parts.insert(-1, f"--exploitbench-seed {exploitbench_seed}")
 
         cmd = " ".join(cmd_parts)
         # Catch-all OS-level timeout against hangs. A wedged headless browser in
@@ -946,6 +959,15 @@ if [ "{platform}" = "cybergym" ]; then
     }}
 fi
 
+if [ "{platform}" = "exploitbench" ]; then
+    echo "===== ExploitBench setup ====="
+    export EXPLOITBENCH_CONFIG="{exploitbench_config}"
+    bash ~/BoxPwnr-Infra/setup_exploitbench_runner.sh || {{
+        echo "ExploitBench setup failed; aborting benchmark sequence."
+        exit 1
+    }}
+fi
+
 echo "===== Starting benchmark sequence at $(date) ====="
 
 """
@@ -970,8 +992,8 @@ SKIP_TARGET=false
 LATEST_STATS=$(ls -t "{traces_path}"/*/stats.json 2>/dev/null | head -1)
 if [ -n "$LATEST_STATS" ]; then
     LAST_STATUS=$(python3 -c "import json; print(json.load(open('$LATEST_STATS')).get('status',''))" 2>/dev/null)
-    if [ "$LAST_STATUS" != "running" ] && [ "$LAST_STATUS" != "" ]; then
-        echo "Skipping: last trace status is '$LAST_STATUS'"
+    if [ "$LAST_STATUS" = "success" ]; then
+        echo "Skipping: already solved (status: success)"
         SKIP_TARGET=true
     else
         echo "Re-running: last trace was interrupted (status: $LAST_STATUS)"
@@ -2007,7 +2029,7 @@ def main():
     parser.add_argument("--platform", default=DEFAULT_PLATFORM, help=f"Platform (default: {DEFAULT_PLATFORM})")
     parser.add_argument("--executor", default="docker", choices=['docker', 'ssh', 'platform'],
                         help="Executor type (default: docker)")
-    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth', 'grok'],
+    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth', 'grok', 'cursor-cli'],
                        help=f"LLM solver to use (default: {DEFAULT_SOLVER})")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help=f"Maximum conversation turns (default: {DEFAULT_MAX_TURNS})")
     parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST,
@@ -2019,6 +2041,12 @@ def main():
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS, help=f"Number of attempts (default: {DEFAULT_ATTEMPTS})")
     parser.add_argument("--ctf-id", type=int, help="CTF ID (required for htb_ctf platform)")
     parser.add_argument("--ctfd-url", type=str, help="CTFd instance URL (required for ctfd platform)")
+    parser.add_argument("--exploitbench-config", type=str, default="v8",
+                       help="ExploitBench benchmark YAML stem (default: v8)")
+    parser.add_argument("--exploitbench-success-cap", type=str, default="diff",
+                       help="ExploitBench capability required for success (default: diff for smoke runs; use ace for full solve)")
+    parser.add_argument("--exploitbench-seed", type=int, default=1,
+                       help="ExploitBench episode seed metadata (default: 1)")
     
     # Infrastructure arguments
     parser.add_argument("--key-path", help="Path to AWS EC2 SSH key file")
@@ -2371,7 +2399,10 @@ def main():
         getattr(args, 'executor', 'docker'),
         remote_resume_path,
         auto_stop=not args.no_auto_stop,
-        use_spot=not getattr(args, 'no_spot', False)
+        use_spot=not getattr(args, 'no_spot', False),
+        exploitbench_config=getattr(args, 'exploitbench_config', 'v8'),
+        exploitbench_success_cap=getattr(args, 'exploitbench_success_cap', 'diff'),
+        exploitbench_seed=getattr(args, 'exploitbench_seed', 1),
     )
     
     # Print dashboard URL at the very end for easy access
