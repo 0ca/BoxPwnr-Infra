@@ -27,7 +27,7 @@ DEFAULT_TARGET = "meow"
 DEFAULT_PLATFORM = "htb"
 DEFAULT_SOLVER = "single_loop"  # Default solver to match main CLI
 DEFAULT_MAX_TURNS = 80
-DEFAULT_MAX_COST = 2.0  # Default max cost per attempt in USD
+DEFAULT_MAX_COST = None  # Default: no max cost (useful for subscription-based solvers like grok / claude_code)
 DEFAULT_ATTEMPTS = 1
 DEFAULT_INSTANCE_COUNT = 1
 DEFAULT_MAX_TIME = 60  # Default max time per attempt in minutes
@@ -436,7 +436,7 @@ def ensure_shared_infrastructure():
         print(f"Failed to create shared infrastructure: {e}")
         sys.exit(1)
 
-def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=True):
+def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=False):
     """Deploy infrastructure for a specific runner using separate Terraform state.
 
     Args:
@@ -538,11 +538,12 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, u
         use_golden_ami = GOLDEN_AMI_FILE.exists()
         # Per-platform disk sizes (GB): non-golden-AMI / golden-AMI
         PLATFORM_DISK_SIZES = {
-            "cybench":   (90, 60),
-            "cybergym":  (120, 90),  # vulnerable Docker images run 0.5–3 GB each, lazy-pulled
-            "xbow":      (80, 50),
-            "hackbench": (80, 50),
-            "argus":     (120, 90),  # docker images per challenge — 50 GB ran out at ~30 challenges
+            "cybench":      (90, 60),
+            "cybergym":     (120, 90),  # vulnerable Docker images run 0.5–3 GB each, lazy-pulled
+            "exploitbench": (200, 150),  # CVE env images ~65GB each (amd64-only); lazy-pulled per target
+            "xbow":         (80, 50),
+            "hackbench":    (80, 50),
+            "argus":        (120, 90),  # docker images per challenge — 50 GB ran out at ~30 challenges
         }
         default_sizes = (45, 35)
         non_golden_size, golden_size = PLATFORM_DISK_SIZES.get(platform, default_sizes)
@@ -597,6 +598,7 @@ def transfer_files(instance_ip, key_path):
         "--exclude", "__pycache__",
         "--exclude", "cybench-repo",
         "--exclude", "cybergym-repo",
+        "--exclude", "exploitbench-repo",
         "--exclude", "validation-benchmarks",
         "--exclude", "HackBench",
         "--exclude", "replayer/tests",
@@ -689,6 +691,14 @@ echo "=== Python environment info ==="
 which python
 python --version
 echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+
+# Install the Chromium browser for Playwright. Required by the nvidia-web
+# LLM provider, which drives build.nvidia.com in a headless browser.
+# `playwright` (the Python package) is installed by `uv sync`, but the browser
+# binary + its OS libs are not — this fetches both. Idempotent: re-running is
+# a no-op once the browser is cached under ~/.cache/ms-playwright.
+echo "=== Installing Playwright Chromium browser ==="
+python -m playwright install --with-deps chromium
 
 
 # Install Node.js and mermaid-cli (mmdc) for diagram generation
@@ -802,7 +812,7 @@ echo "=== Environment setup complete ==="
         print(f"Failed during environment setup: {e}")
         sys.exit(1)
 
-def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True):
+def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_hash, model, targets, platform, solver, max_turns, max_cost, max_time, attempts, runner_id, reasoning_effort=None, ctf_id=None, ctfd_url=None, dashboard_bucket=None, executor="docker", resume_from=None, auto_stop=True, use_spot=True, exploitbench_config="v8", exploitbench_success_cap="diff", exploitbench_seed=1):
     """Start the BoxPwnr benchmark in a tmux session using a single determined directory path.
 
     Args:
@@ -813,9 +823,9 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         model: LLM model to use
         targets: List of target machine names to benchmark
         platform: Platform (htb, etc.)
-        solver: LLM solver to use (single_loop_xmltag, single_loop, single_loop_compactation, claude_code, codex)
+        solver: LLM solver to use (single_loop_xmltag, single_loop, single_loop_compactation, claude_code, codex, grok)
         max_turns: Maximum number of conversation turns
-        max_cost: Maximum cost per attempt in USD
+        max_cost: Maximum cost per attempt in USD (None = no limit, good for subscriptions)
         max_time: Maximum time in minutes per attempt (None for no limit)
         attempts: Number of attempts per target
         runner_id: The runner ID
@@ -824,6 +834,11 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         dashboard_bucket: Optional S3 bucket name for the monitoring dashboard.
             When set, the generated run_benchmarks.sh will push stats to S3
             after each target completes.
+        use_spot: When True (spot instances), the generated run_benchmarks.sh
+            skips targets that already have a completed trace so a
+            spot-eviction reboot resumes cleanly. When False (on-demand),
+            the skip block is omitted so reusing the runner to relaunch
+            attempts re-runs every target.
     """
     print(f"\n=== Starting benchmark on {instance_ip} ===")
     
@@ -842,13 +857,22 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
             f"--platform {platform}",
             f"--target \"{target}\"",
             f"--max-turns {max_turns}",
-            f"--max-cost {max_cost}",
             f"--model \"{model}\"",
             f"--solver {solver}",
             "--traces-dir BoxPwnr-Traces/",
             f"--attempts {attempts}",
-            "--analyze-attempt --generate-summary --generate-progress"
         ]
+
+        # Post-processing (analyze/summary/progress) makes extra LLM calls AFTER the
+        # main loop. On cybergym (NVIDIA NIM) these can hang on API timeouts and the
+        # status never finalizes (stats.json stuck "running"), wedging the sequence.
+        # Skip them for cybergym; keep for everything else.
+        if platform != "cybergym":
+            cmd_parts.append("--analyze-attempt --generate-summary --generate-progress")
+
+        # Only set max-cost when explicitly provided (useful for subscription solvers like grok)
+        if max_cost is not None and max_cost > 0:
+            cmd_parts.insert(5, f"--max-cost {max_cost}")  # insert after --max-turns
 
         # Add max time if specified
         if max_time:
@@ -870,7 +894,24 @@ def start_benchmark_simplified(instance_ip, key_path, ecr_repo_url, dockerfile_h
         if resume_from:
             cmd_parts.insert(-1, f"--resume-from \"{resume_from}\"")
 
+        if platform == "exploitbench":
+            cmd_parts.insert(-1, f"--exploitbench-config {exploitbench_config}")
+            cmd_parts.insert(-1, f"--exploitbench-success-cap {exploitbench_success_cap}")
+            cmd_parts.insert(-1, f"--exploitbench-seed {exploitbench_seed}")
+
         cmd = " ".join(cmd_parts)
+        # Catch-all OS-level timeout against hangs. A wedged headless browser in
+        # the nvidia-web provider once froze runners for ~24h; --max-time only
+        # bounds the solve loop, not the post-solve analysis or a hung renderer.
+        # One boxpwnr invocation runs `attempts` attempts back-to-back, each with
+        # up to max_time minutes of solving plus analysis/setup overhead.
+        # Buffer above max_time must cover post-solve analysis AND the
+        # nvidia-web cold-start captcha retries (up to ~20 min of reloads on a
+        # bad start). +25 was too tight and killed legit long runs mid-flight.
+        per_attempt_cap_min = (max_time or DEFAULT_MAX_TIME) + 45
+        hang_timeout_s = int(attempts * per_attempt_cap_min * 60)
+        # `timeout -k 60`: SIGTERM, then SIGKILL 60s later if still alive.
+        cmd = f"timeout -k 60 {hang_timeout_s} {cmd}"
         benchmark_commands.append(cmd)
     
     # For logging/debugging purposes
@@ -918,6 +959,15 @@ if [ "{platform}" = "cybergym" ]; then
     }}
 fi
 
+if [ "{platform}" = "exploitbench" ]; then
+    echo "===== ExploitBench setup ====="
+    export EXPLOITBENCH_CONFIG="{exploitbench_config}"
+    bash ~/BoxPwnr-Infra/setup_exploitbench_runner.sh || {{
+        echo "ExploitBench setup failed; aborting benchmark sequence."
+        exit 1
+    }}
+fi
+
 echo "===== Starting benchmark sequence at $(date) ====="
 
 """
@@ -929,17 +979,21 @@ echo "===== Starting benchmark sequence at $(date) ====="
         for ch in ['/', '\\', ':', '|', '*', '?', '<', '>', '"']:
             sanitized = sanitized.replace(ch, '-')
         traces_path = f"BoxPwnr-Traces/{platform}/{sanitized}/traces"
-        benchmark_script += f"""
-echo ""
-echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} ====="
 
+        # Skip-completed-trace guard is only useful for spot eviction recovery:
+        # after a reboot, @reboot cron re-runs run_benchmarks.sh and we don't
+        # want to redo targets that already finished. On on-demand runs the
+        # same logic backfires when the operator reuses the runner to launch
+        # more attempts against the same targets, so leave it out.
+        if use_spot:
+            skip_block = f"""
 # Skip if target already has a completed trace (not interrupted mid-run)
 SKIP_TARGET=false
 LATEST_STATS=$(ls -t "{traces_path}"/*/stats.json 2>/dev/null | head -1)
 if [ -n "$LATEST_STATS" ]; then
     LAST_STATUS=$(python3 -c "import json; print(json.load(open('$LATEST_STATS')).get('status',''))" 2>/dev/null)
-    if [ "$LAST_STATUS" != "running" ] && [ "$LAST_STATUS" != "" ]; then
-        echo "Skipping: last trace status is '$LAST_STATUS'"
+    if [ "$LAST_STATUS" = "success" ]; then
+        echo "Skipping: already solved (status: success)"
         SKIP_TARGET=true
     else
         echo "Re-running: last trace was interrupted (status: $LAST_STATUS)"
@@ -952,6 +1006,22 @@ if [ "$SKIP_TARGET" = false ]; then
     echo "Completed at: $(date)"
 fi
 """
+        else:
+            skip_block = f"""
+echo "Starting at: $(date)"
+{benchmark_commands[i]}
+echo "Completed at: $(date)"
+"""
+
+        benchmark_script += f"""
+echo ""
+echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} ====="
+# Remove any leftover challenge container from a prior killed/crashed attempt.
+# Without this, a single timed-out/crashed run orphans the "challenge"
+# container and every subsequent target fails to start with a name conflict
+# ("The container name /challenge is already in use") -> cascade of init_errors.
+docker rm -f challenge >/dev/null 2>&1 || true
+{skip_block}"""
     
     # Finish the script
     auto_stop_block = ""
@@ -1959,16 +2029,24 @@ def main():
     parser.add_argument("--platform", default=DEFAULT_PLATFORM, help=f"Platform (default: {DEFAULT_PLATFORM})")
     parser.add_argument("--executor", default="docker", choices=['docker', 'ssh', 'platform'],
                         help="Executor type (default: docker)")
-    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth'],
+    parser.add_argument("--solver", default=DEFAULT_SOLVER, choices=['single_loop_xmltag', 'single_loop', 'single_loop_compactation', 'claude_code', 'codex', 'hacksynth', 'grok', 'cursor-cli'],
                        help=f"LLM solver to use (default: {DEFAULT_SOLVER})")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS, help=f"Maximum conversation turns (default: {DEFAULT_MAX_TURNS})")
-    parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST, help=f"Maximum cost per attempt in USD (default: {DEFAULT_MAX_COST})")
+    parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST,
+                       help="Maximum cost per attempt in USD (default: no limit). "
+                            "Omit this for subscription-based solvers (grok, claude_code with OAuth, etc.)")
     # Default to 60 minutes when user doesn't specify max-time.
     parser.add_argument("--max-time", type=int, default=DEFAULT_MAX_TIME,
                        help=f"Maximum time in minutes per attempt (default: {DEFAULT_MAX_TIME})")
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS, help=f"Number of attempts (default: {DEFAULT_ATTEMPTS})")
     parser.add_argument("--ctf-id", type=int, help="CTF ID (required for htb_ctf platform)")
     parser.add_argument("--ctfd-url", type=str, help="CTFd instance URL (required for ctfd platform)")
+    parser.add_argument("--exploitbench-config", type=str, default="v8",
+                       help="ExploitBench benchmark YAML stem (default: v8)")
+    parser.add_argument("--exploitbench-success-cap", type=str, default="diff",
+                       help="ExploitBench capability required for success (default: diff for smoke runs; use ace for full solve)")
+    parser.add_argument("--exploitbench-seed", type=int, default=1,
+                       help="ExploitBench episode seed metadata (default: 1)")
     
     # Infrastructure arguments
     parser.add_argument("--key-path", help="Path to AWS EC2 SSH key file")
@@ -1988,9 +2066,9 @@ def main():
     parser.add_argument("--no-auto-stop", action="store_true",
                        help="Don't automatically stop the EC2 instance after all benchmarks finish. "
                             "By default, the instance is stopped (not terminated) when benchmarks complete.")
-    parser.add_argument("--no-spot", action="store_true",
-                       help="Use on-demand instances instead of spot instances. "
-                            "More expensive but won't be interrupted mid-challenge.")
+    parser.add_argument("--spot", action="store_true",
+                       help="Use Spot instances (cheaper, but can be interrupted or evicted). "
+                            "Default is on-demand for maximum reliability during long benchmarks.")
     
     args = parser.parse_args()
     
@@ -2092,6 +2170,13 @@ def main():
     else:
         print(f"No target specified, using default: {DEFAULT_TARGET}")
         target_list = [DEFAULT_TARGET]
+
+    # Smart default for Grok: if user didn't explicitly choose a model and we're using grok solver,
+    # use a descriptive name so the dashboard and traces show something meaningful instead of the
+    # generic "openrouter/openrouter/free" default.
+    if args.solver == "grok" and args.model == DEFAULT_MODEL:
+        args.model = "grok-build-0.1"
+        print("Note: Using --model grok-build-0.1 for Grok solver (for better logging/dashboard)")
         
     # Validate key path - expand user directory and resolve to full absolute path
     key_path = os.path.abspath(os.path.expanduser(args.key_path))
@@ -2126,7 +2211,7 @@ def main():
     print(f"Targets:         {', '.join(target_list)}")
     print(f"Platform:        {args.platform}")
     print(f"Max Turns:       {args.max_turns}")
-    print(f"Max Cost:        ${args.max_cost}")
+    print(f"Max Cost:        ${args.max_cost}" if args.max_cost else "Max Cost:        No limit (subscription)")
     print(f"Max Time:        {args.max_time} minutes" if args.max_time else "Max Time:        No limit")
     print(f"Attempts:        {args.attempts}")
     print(f"Runner:          {target_runner_id}")
@@ -2139,7 +2224,7 @@ def main():
     # STEP 1: Deploy infrastructure for the specific runner
     
     print(f"\n=== Step 1: Setting up AWS infrastructure for runner {target_runner_id} ===")
-    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=not getattr(args, 'no_spot', False))
+    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=getattr(args, 'spot', False))
     
     # Create runner manager and add this runner
     runner_manager = RunnerManager()
@@ -2238,6 +2323,39 @@ def main():
         ]
         run_command(rsync_env_cmd)
     
+    # Automatically transfer Grok auth when using --solver grok
+    # (so the remote runner can inject it into challenge containers)
+    if getattr(args, 'solver', None) == "grok":
+        grok_auth_local = os.path.expanduser("~/.grok/auth.json")
+        if os.path.exists(grok_auth_local):
+            print("Transferring ~/.grok/auth.json for Grok solver...")
+            # Ensure remote ~/.grok directory exists with correct permissions
+            mkdir_cmd = [
+                "ssh", "-i", key_path, "-o", "StrictHostKeyChecking=no",
+                f"ubuntu@{instance_ip}",
+                "mkdir -p ~/.grok && chmod 700 ~/.grok"
+            ]
+            run_command(mkdir_cmd, capture_output=True)
+            
+            rsync_grok_cmd = [
+                "rsync", "-avz",
+                "-e", f"ssh -i \"{key_path}\" -o StrictHostKeyChecking=no",
+                grok_auth_local,
+                f"ubuntu@{instance_ip}:~/.grok/auth.json"
+            ]
+            run_command(rsync_grok_cmd)
+            
+            chmod_cmd = [
+                "ssh", "-i", key_path, "-o", "StrictHostKeyChecking=no",
+                f"ubuntu@{instance_ip}",
+                "chmod 600 ~/.grok/auth.json"
+            ]
+            run_command(chmod_cmd, capture_output=True)
+            print("Grok auth.json transferred successfully to runner.")
+        else:
+            print("WARNING: --solver grok requested but ~/.grok/auth.json not found locally.")
+            print("         The Grok solver will fail to authenticate on the remote runner.")
+    
     # Transfer resume-from progress file if specified
     remote_resume_path = None
     if args.resume_from:
@@ -2280,7 +2398,11 @@ def main():
         args.dashboard_bucket,
         getattr(args, 'executor', 'docker'),
         remote_resume_path,
-        auto_stop=not args.no_auto_stop
+        auto_stop=not args.no_auto_stop,
+        use_spot=not getattr(args, 'no_spot', False),
+        exploitbench_config=getattr(args, 'exploitbench_config', 'v8'),
+        exploitbench_success_cap=getattr(args, 'exploitbench_success_cap', 'diff'),
+        exploitbench_seed=getattr(args, 'exploitbench_seed', 1),
     )
     
     # Print dashboard URL at the very end for easy access
