@@ -25,9 +25,14 @@ data "terraform_remote_state" "shared" {
 # --- User data scripts ---
 
 locals {
-  # Golden AMI: everything pre-installed, just mark boot as done
+  # Golden AMI: everything pre-installed, just mark boot as done.
+  # Belt-and-suspenders: ensure `make` exists even on older golden AMIs built
+  # before it was added to build_ami.sh — the xbow platform's build step shells
+  # out to `make`, and without it every attempt fails with init_error at 0 turns.
+  # Idempotent: a no-op on AMIs that already have make.
   golden_ami_user_data = <<-EOF
 #!/bin/bash
+command -v make >/dev/null 2>&1 || { apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y make; }
 touch /var/lib/cloud/instance/boot-finished
 EOF
 
