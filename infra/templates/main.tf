@@ -72,6 +72,21 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 # Add ubuntu user to docker group
 usermod -aG docker ubuntu
 
+# Harden DNS resolution. By default the runner has a single upstream (the AWS
+# VPC .2 resolver) with no fallback or caching; under heavy image pulls (e.g.
+# ExploitBench's 65GB CVE images) that resolver rate-limits and returns SERVFAIL
+# ("server misbehaving"), turning pulls into init_errors. Give systemd-resolved
+# the link-local AWS resolver plus public fallbacks and enable caching to cut
+# query volume.
+cat > /etc/systemd/resolved.conf << 'RESOLVED_EOF'
+[Resolve]
+DNS=169.254.169.253 1.1.1.1 8.8.8.8
+FallbackDNS=8.8.4.4 1.0.0.1
+Cache=yes
+DNSStubListener=yes
+RESOLVED_EOF
+systemctl restart systemd-resolved || true
+
 # Configure tmux for better usability (mouse support, large scrollback)
 cat > /home/ubuntu/.tmux.conf << 'TMUX_EOF'
 # Enable mouse support - allows scrolling with mouse wheel
