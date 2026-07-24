@@ -18,6 +18,12 @@ variable "root_volume_size" {
   default     = 40
 }
 
+variable "instance_type" {
+  description = "EC2 instance type. Small default for hosted CTFs; larger for heavy platforms like exploitbench (V8 grade() is CPU/RAM-bound)."
+  type        = string
+  default     = "t3.small"
+}
+
 variable "architecture" {
   description = "The architecture for the EC2 instance (amd64 or arm64)."
   type        = string
@@ -36,9 +42,9 @@ variable "use_golden_ami" {
 }
 
 variable "use_spot" {
-  description = "Whether to use Spot instances (cheaper but can be interrupted). Existing on-demand instances are unaffected."
+  description = "Whether to use Spot instances (cheaper but can be interrupted). Default is on-demand for reliability."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "runner_id" {

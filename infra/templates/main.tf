@@ -129,7 +129,7 @@ EOF
 
 resource "aws_instance" "boxpwnr_eval_instance" {
   ami                    = data.terraform_remote_state.shared.outputs.ami_id
-  instance_type          = "t3.small"
+  instance_type          = var.instance_type
   key_name               = var.ec2_key_pair_name
   vpc_security_group_ids = [data.terraform_remote_state.shared.outputs.security_group_id]
   iam_instance_profile   = data.terraform_remote_state.shared.outputs.iam_instance_profile_name

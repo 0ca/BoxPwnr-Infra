@@ -436,7 +436,7 @@ def ensure_shared_infrastructure():
         print(f"Failed to create shared infrastructure: {e}")
         sys.exit(1)
 
-def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=False):
+def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, use_spot=False, instance_type=None):
     """Deploy infrastructure for a specific runner using separate Terraform state.
 
     Args:
@@ -540,7 +540,7 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, u
         PLATFORM_DISK_SIZES = {
             "cybench":      (90, 60),
             "cybergym":     (120, 90),  # vulnerable Docker images run 0.5–3 GB each, lazy-pulled
-            "exploitbench": (200, 150),  # CVE env images ~65GB each (amd64-only); lazy-pulled per target
+            "exploitbench": (250, 220),  # CVE env images ~65GB each; need headroom for extract layers
             "xbow":         (80, 50),
             "hackbench":    (80, 50),
             "argus":        (120, 90),  # docker images per challenge — 50 GB ran out at ~30 challenges
@@ -549,10 +549,19 @@ def deploy_runner_infrastructure(runner_id: int, key_path=None, platform=None, u
         non_golden_size, golden_size = PLATFORM_DISK_SIZES.get(platform, default_sizes)
         volume_size = golden_size if use_golden_ami else non_golden_size
         print(f"Using {volume_size}GB disk (platform: {platform}, golden_ami: {use_golden_ami})")
+
+        # Per-platform instance type. exploitbench's V8 grade() is CPU/RAM-bound
+        # and times out on t3.small (2 vCPU/2GB) — give it a compute box.
+        PLATFORM_INSTANCE_TYPES = {
+            "exploitbench": "c5.2xlarge",  # 8 vCPU / 16GB — fast grade(), no MCP stalls
+        }
+        eff_instance_type = instance_type or PLATFORM_INSTANCE_TYPES.get(platform, "t3.small")
+        print(f"Using instance type: {eff_instance_type} (platform: {platform})")
         tf_apply_cmd = [
             "terraform", "apply", "-auto-approve",
             f"-var=runner_id={runner_id}",
             f"-var=root_volume_size={volume_size}",
+            f"-var=instance_type={eff_instance_type}",
             f"-var=use_golden_ami={str(use_golden_ami).lower()}",
             f"-var=use_spot={str(use_spot).lower()}",
         ]
@@ -962,6 +971,9 @@ fi
 if [ "{platform}" = "exploitbench" ]; then
     echo "===== ExploitBench setup ====="
     export EXPLOITBENCH_CONFIG="{exploitbench_config}"
+    export EXPLOITBENCH_GRADE_TIMEOUT=3600
+    export EXPLOITBENCH_LAZY_PULL=1
+    export EXPLOITBENCH_TASKS_FILE="$HOME/BoxPwnr/run_benchmarks.sh"
     bash ~/BoxPwnr-Infra/setup_exploitbench_runner.sh || {{
         echo "ExploitBench setup failed; aborting benchmark sequence."
         exit 1
@@ -992,8 +1004,14 @@ SKIP_TARGET=false
 LATEST_STATS=$(ls -t "{traces_path}"/*/stats.json 2>/dev/null | head -1)
 if [ -n "$LATEST_STATS" ]; then
     LAST_STATUS=$(python3 -c "import json; print(json.load(open('$LATEST_STATS')).get('status',''))" 2>/dev/null)
-    if [ "$LAST_STATUS" = "success" ]; then
-        echo "Skipping: already solved (status: success)"
+    # Skip any task whose latest trace reached a TERMINAL status — not just
+    # "success". With --attempts 1 a finished-but-unsolved task (e.g.
+    # limit_interrupted) is a completed attempt and must NOT be re-run, or every
+    # spot-eviction resume re-churns all unsolved tasks from the top (90 min each)
+    # and a frequently-evicted runner never advances. Only re-run truly-interrupted
+    # ("running"/empty) traces.
+    if [ -n "$LAST_STATUS" ] && [ "$LAST_STATUS" != "running" ]; then
+        echo "Skipping: already completed (status: $LAST_STATUS)"
         SKIP_TARGET=true
     else
         echo "Re-running: last trace was interrupted (status: $LAST_STATUS)"
@@ -1013,6 +1031,19 @@ echo "Starting at: $(date)"
 echo "Completed at: $(date)"
 """
 
+        exploitbench_prep = ""
+        exploitbench_cleanup = ""
+        if platform == "exploitbench":
+            exploitbench_prep = f"""
+bash ~/BoxPwnr-Infra/pull_exploitbench_target_image.sh "{target}" || {{
+    echo "Failed to pull image for {target}; skipping."
+    continue
+}}
+"""
+            exploitbench_cleanup = f"""
+bash ~/BoxPwnr-Infra/cleanup_exploitbench_target_image.sh "{target}" || true
+"""
+
         benchmark_script += f"""
 echo ""
 echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} ====="
@@ -1021,7 +1052,7 @@ echo "===== [{i+1}/{len(targets)}] Starting benchmark for target: {target} =====
 # container and every subsequent target fails to start with a name conflict
 # ("The container name /challenge is already in use") -> cascade of init_errors.
 docker rm -f challenge >/dev/null 2>&1 || true
-{skip_block}"""
+{exploitbench_prep}{skip_block}{exploitbench_cleanup}"""
     
     # Finish the script
     auto_stop_block = ""
@@ -2069,7 +2100,12 @@ def main():
     parser.add_argument("--spot", action="store_true",
                        help="Use Spot instances (cheaper, but can be interrupted or evicted). "
                             "Default is on-demand for maximum reliability during long benchmarks.")
-    
+    parser.add_argument("--no-spot", action="store_true",
+                       help="Use on-demand EC2 instances (default). Disables --spot if both are passed.")
+    parser.add_argument("--instance-type", type=str, default=None,
+                       help="Override EC2 instance type (e.g. c5.2xlarge). Default: per-platform "
+                            "(exploitbench uses c5.2xlarge; others t3.small).")
+
     args = parser.parse_args()
     
     # Handle special operations that don't require full setup
@@ -2224,7 +2260,7 @@ def main():
     # STEP 1: Deploy infrastructure for the specific runner
     
     print(f"\n=== Step 1: Setting up AWS infrastructure for runner {target_runner_id} ===")
-    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=getattr(args, 'spot', False))
+    runner_info = deploy_runner_infrastructure(target_runner_id, key_path, platform=args.platform, use_spot=getattr(args, 'spot', False), instance_type=getattr(args, 'instance_type', None))
     
     # Create runner manager and add this runner
     runner_manager = RunnerManager()
@@ -2399,7 +2435,7 @@ def main():
         getattr(args, 'executor', 'docker'),
         remote_resume_path,
         auto_stop=not args.no_auto_stop,
-        use_spot=not getattr(args, 'no_spot', False),
+        use_spot=getattr(args, 'spot', False) and not getattr(args, 'no_spot', False),
         exploitbench_config=getattr(args, 'exploitbench_config', 'v8'),
         exploitbench_success_cap=getattr(args, 'exploitbench_success_cap', 'diff'),
         exploitbench_seed=getattr(args, 'exploitbench_seed', 1),
