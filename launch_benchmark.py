@@ -2267,13 +2267,13 @@ def main():
     dashboard_url = None
     if args.dashboard_bucket:
         upload_dashboard_html(args.dashboard_bucket)
-        # Update active-runners manifest so the dashboard includes this runner
-        all_runner_ids = [
-            int(d.name.split("-")[1])
-            for d in INFRA_DIR.iterdir()
-            if d.is_dir() and d.name.startswith("runner-")
-        ]
-        upload_active_runners_manifest(args.dashboard_bucket, all_runner_ids)
+        # Update active-runners manifest so the dashboard includes this runner.
+        # Use load_runner_state() (not raw directory listing) so destroyed
+        # runners whose dirs were never cleaned up don't reappear on the dashboard.
+        active_ids = list(load_runner_state().get_all_runners().keys())
+        if target_runner_id not in active_ids:
+            active_ids.append(target_runner_id)
+        upload_active_runners_manifest(args.dashboard_bucket, active_ids)
         # Construct the website URL (S3 static website hosting format)
         region = get_aws_region()
         dashboard_url = f"http://{args.dashboard_bucket}.s3-website-{region}.amazonaws.com"
